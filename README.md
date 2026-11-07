@@ -1,351 +1,398 @@
-# Tracker Satoshi
+# Finding Satoshi's Wallet
 
-Kumpulan tool untuk:
+A set of tools to:
 
-1. **Memantau alamat Bitcoin** (default: alamat genesis Satoshi), yaitu saldo dan riwayat transaksinya.
-2. **Mereplikasi analisis "Patoshi pattern"** untuk memperkirakan blok dan alamat yang ditambang Satoshi Nakamoto di tahun 2009–2010, sekaligus **isi (saldo BTC) setiap alamatnya**.
+1. **Monitor a Bitcoin address** (default: Satoshi's genesis address): its balance and transaction history.
+2. **Replicate the "Patoshi pattern" analysis** to estimate which blocks and addresses Satoshi Nakamoto mined in 2009–2010, and **how much BTC each address holds**.
 
-Semua data diambil dari **API publik [mempool.space](https://mempool.space)**. Tidak perlu full node, login, atau API key. Cukup Python 3 (library bawaan saja) dan bash.
+All data comes from the **public [mempool.space](https://mempool.space) API**. No full node, login or API key is needed. Python 3 (standard library only) and bash are enough.
 
-> **Catatan:** semua data ini hanya **data publik untuk dibaca**. Mengetahui alamat **tidak** memberi akses ke koinnya, karena untuk itu dibutuhkan private key. Hati-hati dengan "tools" yang mengaku bisa membuka wallet Satoshi atau wallet lama. Semuanya scam.
-
----
-
-## Isi folder
-
-| File | Jenis | Fungsi |
-|---|---|---|
-| `cek_alamat_btc.py` | script | Cek saldo dan transaksi terbaru satu alamat, lalu simpan ke CSV |
-| `patoshi_scan.py` | script | Unduh data blok awal, lalu filter pola Patoshi |
-| `run_patoshi.sh` | script | Menjalankan `patoshi_scan.py` secara pelan per batch: tahap `unduh` (sekitar 1 hari) dan `saldo` (sekitar 2–3 hari), dijalankan terpisah |
-| `riwayat_saldo.csv` | output | Riwayat saldo, satu baris per run `cek_alamat_btc.py` |
-| `transaksi_<alamat>.csv` | output | Transaksi terbaru dari run terakhir |
-| `blok_awal.csv` | output | Data mentah setiap blok 0–54.316 |
-| `saldo_alamat.csv` | output | Cache hasil cek saldo per alamat Patoshi (append) |
-| `alamat_patoshi.csv` | output | Blok dan alamat yang cocok dengan pola Patoshi, plus tingkat keyakinan dan kolom saldo |
-| `wallet_satoshi.csv` | output | Daftar ringkas alamat keyakinan tinggi+sedang dengan saldo BTC-nya (`patoshi_scan.py daftar`) |
-| `buat_bubble.py` | script | Bubble plot interaktif semua alamat -> `bubble_satoshi.html` |
-| `buat_aliran.py` + `aliran_template.html` | script | Graf node aliran dana dari reward yang pernah dipindah -> `aliran_dana.html` |
-| `buat_kaggle.py` | script | Membangun paket dataset Kaggle (`kaggle_dataset/`) |
-| `plot_extranonce.png` | output | Plot ExtraNonce vs height, diwarnai per tingkat keyakinan |
-| `patoshi.log` / `patoshi_saldo.log` | output | Log tahap unduh / saldo dari `run_patoshi.sh` |
-| `.run_patoshi.lock` | internal | Lock file supaya `run_patoshi.sh` tidak berjalan dobel |
+> **Note:** all of this is **public, read-only data**. Knowing an address does **not** give access to its coins; that requires the private key. Beware of "tools" claiming to unlock Satoshi's wallet or other old wallets. They are all scams.
 
 ---
 
-## Pipeline 1: Monitor alamat (`cek_alamat_btc.py`)
-
-### Alur
+## Architecture (Domain-Driven Design)
 
 ```
-mempool.space /api/address/<alamat>       ──► saldo, total masuk/keluar, jumlah tx
-mempool.space /api/v1/prices              ──► harga BTC (USD)
-mempool.space /api/address/<alamat>/txs   ──► transaksi terbaru
+Finding-Satoshi-Wallet/
+├── satoshi_tracker/                 Python package (standard library only; matplotlib for figures)
+│   ├── domain/                      pure business rules, no I/O
+│   │   ├── bitcoin.py               amounts, Base58Check / P2PKH address derivation, coinbase ExtraNonce parsing
+│   │   ├── block.py                 Block entity
+│   │   ├── patoshi.py               nonce LSB rule, ExtraNonce line classifier, Confidence, statistical estimate
+│   │   ├── balance.py               RewardBalance value object, RewardStatus (no / yes / genesis)
+│   │   └── flow.py                  FundFlowGraph aggregate, known addresses
+│   ├── application/                 use cases (one per module), adapters injected
+│   │   ├── download_blocks.py       download block features for a height range (resumable)
+│   │   ├── classify_patoshi.py      apply both signals, store graded candidates
+│   │   ├── check_balances.py        3-request balance check per address
+│   │   ├── wallet_list.py           compact attributed-address list
+│   │   ├── trace_fund_flow.py       follow moved rewards through later transactions
+│   │   └── monitor_address.py       snapshot one address
+│   ├── infrastructure/              adapters
+│   │   ├── mempool.py               MempoolClient (retry, delay) and CachedMempoolClient (JSON cache)
+│   │   └── csv_repositories.py      Block / Patoshi / Balance / WalletList / AddressHistory repositories
+│   ├── interfaces/                  presentation
+│   │   ├── cli.py                   `python3 -m satoshi_tracker <command>`
+│   │   ├── plots.py                 ExtraNonce vs height figure
+│   │   ├── pages.py                 bubble plot + fund-flow HTML pages
+│   │   ├── kaggle_export.py         Kaggle dataset package
+│   │   └── templates/               bubble.html, flow.html
+│   └── config.py                    paths and settings (all overridable by environment)
+├── scripts/run_patoshi.sh           slow, resumable, lock-protected batch runner
+├── tests/test_domain.py             domain tests against ground truth (genesis, block 9, ...)
+├── data/                            CSV datasets (committed)
+└── output/                          generated figures, HTML, cache, logs, Kaggle package (not committed)
+```
+
+Dependencies point inwards only: `interfaces → application → domain`, with `infrastructure` implementing the
+storage and API access that the use cases receive as arguments. The domain has no knowledge of HTTP or CSV.
+
+### Commands
+
+| Command | Does |
+|---|---|
+| `python3 -m satoshi_tracker scan [start end]` | download + analyze (default blocks 0–54,316) |
+| `python3 -m satoshi_tracker download [start end]` | download block features only |
+| `python3 -m satoshi_tracker analyze [start end]` | classify Patoshi candidates -> `data/patoshi_addresses.csv` |
+| `python3 -m satoshi_tracker balance [start end]` | check balances (levels from `PATOSHI_CONFIDENCE`, default `high`) |
+| `python3 -m satoshi_tracker list` | `data/satoshi_wallets.csv` |
+| `python3 -m satoshi_tracker plot` | `output/plot_extranonce.png` |
+| `python3 -m satoshi_tracker bubble` | `output/bubble_satoshi.html` |
+| `python3 -m satoshi_tracker flow` | `output/fund_flow.html` |
+| `python3 -m satoshi_tracker kaggle [--article ARTICLE.md]` | `output/kaggle_dataset/` |
+| `python3 -m satoshi_tracker monitor [address] [n]` | balance and recent transactions of one address |
+| `python3 -m unittest discover tests` | run the tests |
+
+Exit codes: `0` ok, `1` API error after all retries, `2` nothing to do (used by the runner to skip a batch).
+
+### Data files (`data/`)
+
+| File | Content |
+|---|---|
+| `blocks.csv` | Raw features of every block 0–54,316 |
+| `patoshi_addresses.csv` | Blocks and addresses matching the Patoshi pattern, with confidence level and balance columns |
+| `balances.csv` | Balance check cache per Patoshi address (append-only) |
+| `satoshi_wallets.csv` | Compact list of high + medium confidence addresses with their BTC balance |
+| `balance_history.csv` | Balance history, one row per `monitor` run |
+| `transactions_<address>.csv` | Recent transactions from the latest `monitor` run |
+
+---
+
+## Pipeline 1: Address monitor (`monitor`)
+
+### Flow
+
+```
+mempool.space /api/address/<address>       ──► balance, total received/sent, tx count
+mempool.space /api/v1/prices               ──► BTC price (USD)
+mempool.space /api/address/<address>/txs   ──► recent transactions
                      │
-                     ├──► tampil di terminal
-                     ├──► riwayat_saldo.csv        (append, satu baris per run)
-                     └──► transaksi_<alamat>.csv   (ditimpa setiap run)
+                     ├──► printed to the terminal
+                     ├──► data/balance_history.csv          (appended, one row per run)
+                     └──► data/transactions_<address>.csv   (overwritten each run)
 ```
 
-### Pemakaian
+### Usage
 
 ```bash
-python3 cek_alamat_btc.py                  # alamat genesis 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
-python3 cek_alamat_btc.py <alamat> 20      # alamat lain, tampilkan 20 transaksi terbaru
+python3 -m satoshi_tracker monitor                   # genesis address 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
+python3 -m satoshi_tracker monitor <address> 20      # another address, show the 20 most recent transactions
 ```
 
-API hanya mengembalikan halaman pertama riwayat (sekitar 25 transaksi terbaru), jadi `n` lebih dari 25 tidak menambah hasil.
+The API only returns the first page of history (about 25 recent transactions), so `n` above 25 adds nothing.
 
-### Format CSV
+### CSV format
 
-**`riwayat_saldo.csv`** (satu baris ditambahkan per run, berguna untuk melihat perubahan saldo dari waktu ke waktu)
+**`balance_history.csv`** (one row appended per run, useful to track balance changes over time)
 
-| Kolom | Isi |
+| Column | Content |
 |---|---|
-| `waktu_cek_utc` | Waktu script dijalankan (UTC) |
-| `alamat` | Alamat yang dicek |
-| `saldo_btc` | Saldo terkonfirmasi |
-| `pending_btc` | Selisih dari transaksi yang belum terkonfirmasi |
-| `total_diterima_btc` / `total_dikirim_btc` | Total masuk dan keluar sepanjang waktu |
-| `jumlah_tx` | Jumlah transaksi terkonfirmasi |
-| `harga_btc_usd` / `nilai_usd` | Harga BTC dan nilai saldo dalam USD (kosong kalau API harga gagal) |
+| `checked_utc` | When the script ran (UTC) |
+| `address` | The address checked |
+| `balance_btc` | Confirmed balance |
+| `pending_btc` | Net amount from unconfirmed transactions |
+| `total_received_btc` / `total_sent_btc` | All-time totals in and out |
+| `tx_count` | Number of confirmed transactions |
+| `btc_price_usd` / `value_usd` | BTC price and balance value in USD (empty if the price API fails) |
 
-**`transaksi_<alamat>.csv`** (ditimpa setiap run)
+**`transactions_<address>.csv`** (overwritten each run)
 
-| Kolom | Isi |
+| Column | Content |
 |---|---|
-| `waktu_utc` | Waktu blok (kosong untuk transaksi yang masih pending) |
-| `selisih_btc` | `+` berarti BTC masuk ke alamat, `-` berarti BTC keluar dari alamat |
-| `status` | `confirmed` atau `pending` |
-| `txid` | ID transaksi; bisa dicek di `https://mempool.space/tx/<txid>` |
+| `time_utc` | Block time (empty for pending transactions) |
+| `delta_btc` | `+` means BTC came into the address, `-` means BTC left it |
+| `status` | `confirmed` or `pending` |
+| `txid` | Transaction ID; view it at `https://mempool.space/tx/<txid>` |
 
-Semua waktu dalam **UTC** (WIB = UTC+7).
+All times are **UTC**.
 
 ---
 
-## Pipeline 2: Analisis Patoshi dan saldo (`patoshi_scan.py` dan `run_patoshi.sh`)
+## Pipeline 2: Patoshi analysis and balances (`scan` / `balance` and `scripts/run_patoshi.sh`)
 
-### Latar belakang
+### Background
 
-Pada 2009–2010, reward blok dikirim langsung ke sebuah *public key* (format P2PK), dan software Bitcoin awal membuat key baru untuk setiap blok. Jadi **setiap blok yang ditambang Satoshi = 1 alamat berisi 50 BTC**.
+In 2009–2010, block rewards were paid directly to a *public key* (P2PK format), and the early Bitcoin software generated a new key for every block. So **every block Satoshi mined = 1 address holding 50 BTC**.
 
-Sergio Demian Lerner (2013) menemukan bahwa sekitar 22 ribu blok awal punya pola yang hanya cocok dengan satu penambang, yang disebut **Patoshi pattern**:
+Sergio Demian Lerner (2013) found that about 22 thousand early blocks share a pattern that fits only one miner, called the **Patoshi pattern**:
 
-- **LSB nonce**: byte terakhir nonce hanya muncul di rentang **0–9** dan **19–58**.
-- **ExtraNonce**: nilainya naik dalam deretan yang konsisten dan terpisah dari penambang lain.
-- Koin dari blok-blok ini hampir tidak pernah dipindahkan. Pengecualian terkenal adalah blok 9, yang dikirim ke Hal Finney di blok 170.
+- **Nonce LSB**: the last byte of the nonce only falls in the ranges **0–9** and **19–58**.
+- **ExtraNonce**: its value rises in consistent sequences, separate from other miners.
+- Coins from these blocks have almost never moved. The famous exception is block 9, sent to Hal Finney in block 170.
 
-Label "Satoshi Nakamoto" di Arkham Intelligence (sekitar 22 ribu alamat, sekitar 1,1 juta BTC) berasal dari analisis jenis ini.
+The "Satoshi Nakamoto" label at Arkham Intelligence (about 22 thousand addresses, about 1.1 million BTC) comes from this kind of analysis.
 
-### Alur
+### Flow
 
 ```
                     ┌──────────────────── run_patoshi.sh ────────────────────┐
-                    │  untuk setiap batch (default 500 blok):                │
-                    │    - lewati kalau semua blok sudah ada di CSV           │
-                    │    - patoshi_scan.py unduh <awal> <akhir>              │
-                    │    - kalau gagal: tunggu 30 menit, coba lagi           │
-                    │    - istirahat (default 10 menit)                      │
-                    │  setelah semua selesai: patoshi_scan.py analisa        │
+                    │  for each batch (default 500 blocks):                  │
+                    │    - skip if every block is already in the CSV         │
+                    │    - satoshi_tracker download <start> <end>            │
+                    │    - on failure: wait 30 minutes, retry                │
+                    │    - rest (default 10 minutes)                         │
+                    │  when all done: satoshi_tracker analyze                │
                     └────────────────────────────────────────────────────────┘
-                    ┌────────────── run_patoshi.sh saldo ────────────────────┐
-                    │  untuk setiap batch saldo (default 1000 blok):         │
-                    │    - lewati kalau semua alamat sudah ada di cache      │
-                    │    - patoshi_scan.py saldo <awal> <akhir>              │
-                    │    - gagal: tunggu 30 menit; lalu istirahat            │
-                    │  terakhir: patoshi_scan.py analisa (gabung final)      │
+                    ┌────────────── run_patoshi.sh balance ──────────────────┐
+                    │  for each balance batch (default 1000 blocks):         │
+                    │    - skip if every address is already in the cache     │
+                    │    - satoshi_tracker balance <start> <end>             │
+                    │    - on failure: wait 30 minutes; then rest            │
+                    │  finally: satoshi_tracker analyze (final merge)        │
                     └────────────────────────────────────────────────────────┘
 
-TAHAP 1: UNDUH
-mempool.space /api/v1/blocks/<h>   (1 request = 10 blok: h, h-1, ..., h-9)
+STAGE 1: DOWNLOAD
+mempool.space /api/v1/blocks/<h>   (1 request = 10 blocks: h, h-1, ..., h-9)
         │
         ├─ nonce               ──► nonce_lsb = nonce & 0xFF
-        ├─ extras.coinbaseRaw  ──► extranonce (push data ke-2 di scriptSig coinbase, little-endian)
+        ├─ extras.coinbaseRaw  ──► extranonce (2nd data push of the coinbase scriptSig, little-endian)
         └─ extras.coinbaseSignature "OP_PUSHBYTES_65 <pubkey> OP_CHECKSIG"
-                               ──► pubkey ──► SHA256 ──► RIPEMD160 ──► Base58Check ──► alamat 1xxx
+                               ──► pubkey ──► SHA256 ──► RIPEMD160 ──► Base58Check ──► 1xxx address
         │
         ▼
-blok_awal.csv   (append; blok yang sudah ada tidak diunduh ulang)
+data/blocks.csv   (appended; blocks already present are not downloaded again)
 
-TAHAP 2: ANALISA
-blok_awal.csv ──► filter nonce_lsb di 0–9 atau 19–58 (28.746 blok)
-              ──► analisis garis ExtraNonce ──► keyakinan tinggi / sedang / rendah
-              ──► alamat_patoshi.csv
+STAGE 2: ANALYZE
+blocks.csv ──► filter nonce_lsb in 0–9 or 19–58 (28,746 blocks)
+           ──► ExtraNonce line analysis ──► confidence high / medium / low
+           ──► patoshi_addresses.csv
 
-TAHAP 3: SALDO (3 request per alamat Patoshi)
-/api/block/<hash>/txs/0       ──► txid coinbase + nilai reward (vout[0])
-/api/tx/<txid>/outspends      ──► apakah reward P2PK sudah dibelanjakan, dan oleh tx apa
-/api/address/<alamat 1xxx>    ──► saldo P2PKH (kiriman lain ke alamat dari pubkey yang sama)
+STAGE 3: BALANCE (3 requests per Patoshi address)
+/api/block/<hash>/txs/0       ──► coinbase txid + reward value (vout[0])
+/api/tx/<txid>/outspends      ──► has the P2PK reward been spent, and by which tx
+/api/address/<1xxx address>   ──► P2PKH balance (other payments to the address of the same pubkey)
         │
         ▼
-saldo_alamat.csv (cache, append) ──► digabung ke alamat_patoshi.csv
-                                     total_btc = reward (kalau belum dipindah) + saldo_p2pkh
+balances.csv (cache, appended) ──► merged into patoshi_addresses.csv
+                                   total_btc = reward (if unspent) + p2pkh_balance
 ```
 
-**Kenapa perlu 3 request?** Reward 50 BTC dikirim dalam format **P2PK** (ke public key langsung). Kalau alamat `1xxx` di-query ke API, hasilnya hanya menghitung output **P2PKH**, sehingga reward 50 BTC **tidak ikut terhitung**. Contohnya alamat blok 9 (`12cbQLTF...`) di explorer hanya menunjukkan sekitar 0,44 BTC, padahal reward-nya 50 BTC (yang sudah dipindah ke Hal Finney). Karena itu status reward dicek langsung dari output coinbase-nya.
+**Why 3 requests?** The 50 BTC reward was paid in **P2PK** format (straight to the public key). Querying the `1xxx` address only counts **P2PKH** outputs, so the 50 BTC reward is **not included**. For example, block 9's address (`12cbQLTF...`) shows only about 0.44 BTC in explorers, although its reward was 50 BTC (already moved to Hal Finney). That is why the reward status is checked directly on the coinbase output.
 
-### Pemakaian
+### Usage
 
-**Cara yang disarankan: jalankan setiap tahap pelan di background**
+**Recommended: run each stage slowly in the background**
 
 ```bash
 cd Finding-Satoshi-Wallet
+mkdir -p output
 
-# 1. Unduh blok + analisa pola (sekitar 1 hari)
-nohup ./run_patoshi.sh > patoshi.log 2>&1 &
+# 1. Download blocks + analyze the pattern (about 1 day)
+nohup scripts/run_patoshi.sh > output/patoshi.log 2>&1 &
 
-# 2. (opsional) lihat plot untuk verifikasi visual
-python3 patoshi_scan.py plot
+# 2. (optional) plot for visual verification
+python3 -m satoshi_tracker plot
 
-# 3. Cek saldo alamat keyakinan "tinggi" (sekitar 2,5 hari)
-nohup ./run_patoshi.sh saldo > patoshi_saldo.log 2>&1 &
+# 3. Check balances of "high" confidence addresses (about 2.5 days)
+nohup scripts/run_patoshi.sh balance > output/patoshi_balance.log 2>&1 &
 
-#    ...atau termasuk "sedang" (sekitar 2,8 hari)
-PATOSHI_KEYAKINAN=tinggi,sedang nohup ./run_patoshi.sh saldo > patoshi_saldo.log 2>&1 &
+#    ...or include "medium" as well (about 2.8 days)
+PATOSHI_CONFIDENCE=high,medium nohup scripts/run_patoshi.sh balance > output/patoshi_balance.log 2>&1 &
 ```
 
-Kedua tahap sengaja dipisah. Tahap saldo butuh 3 request per alamat, jadi sebaiknya dijalankan setelah daftar alamat sudah dibersihkan.
+The two stages are deliberately separate. The balance stage needs 3 requests per address, so it is best run once the address list is clean.
 
-| Aksi | Perintah |
+| Action | Command |
 |---|---|
-| Lihat progres | `tail -f patoshi.log` (atau `patoshi_saldo.log`) |
-| Hentikan | `pkill -f run_patoshi.sh; pkill -f patoshi_scan.py` |
-| Lanjutkan | jalankan perintah `nohup ...` yang sama lagi |
-| Status proses | `pgrep -af "run_patoshi\|patoshi_scan"` |
-| Cek jumlah blok tersimpan | `echo $(( $(wc -l < blok_awal.csv) - 1 ))` |
+| Watch progress | `tail -f output/patoshi.log` (or `output/patoshi_balance.log`) |
+| Stop | `pkill -f run_patoshi.sh; pkill -f satoshi_tracker` |
+| Resume | run the same `nohup ...` command again |
+| Process status | `pgrep -af "run_patoshi\|satoshi_tracker"` |
+| Count saved blocks | `echo $(( $(wc -l < data/blocks.csv) - 1 ))` |
 
-**Pengaturan `run_patoshi.sh`** (lewat environment variable)
+**`scripts/run_patoshi.sh` settings** (environment variables)
 
-| Variabel | Default | Arti |
+| Variable | Default | Meaning |
 |---|---|---|
-| `AWAL` | `0` | Blok pertama |
-| `AKHIR` | `54316` | Blok terakhir (sekitar akhir aktivitas Patoshi) |
-| `BATCH` | `500` | Blok per batch (pakai kelipatan 10) |
-| `PATOSHI_JEDA` | `3` | Detik jeda antar request |
-| `ISTIRAHAT` | `600` | Detik istirahat antar batch (kedua tahap) |
-| `BATCH_SALDO` | `1000` | Blok per batch di tahap saldo (sekitar 400 alamat Patoshi, sekitar 1.200 request) |
+| `START` | `0` | First block |
+| `END` | `54316` | Last block (around the end of Patoshi activity) |
+| `BATCH` | `500` | Blocks per batch (use a multiple of 10) |
+| `PATOSHI_DELAY` | `3` | Seconds between requests |
+| `REST` | `600` | Seconds of rest between batches (both stages) |
+| `BATCH_BALANCE` | `1000` | Blocks per batch in the balance stage (about 400 Patoshi addresses, about 1,200 requests) |
 
-Perkiraan durasi:
+Other settings: `PATOSHI_CONFIDENCE` (levels to check), `SATOSHI_DATA_DIR` / `SATOSHI_OUTPUT_DIR` (file locations).
 
-| Tahap | Setelan | Total request | Durasi |
+Estimated duration:
+
+| Stage | Setting | Total requests | Duration |
 |---|---|---|---|
-| Unduh | default | ~5.400 | **~24 jam** |
-| Saldo | keyakinan `tinggi` (default) | ~59.000 | **~2,5 hari** |
-| Saldo | `tinggi,sedang` | ~67.000 | ~2,8 hari |
-| Unduh | `BATCH=300 ISTIRAHAT=2700` | ~5.400 | ~3 hari |
+| Download | default | ~5,400 | **~24 hours** |
+| Balance | `high` confidence (default) | ~59,000 | **~2.5 days** |
+| Balance | `high,medium` | ~67,000 | ~2.8 days (took ~4 days in practice) |
+| Download | `BATCH=300 REST=2700` | ~5,400 | ~3 days |
 
-Contoh: `BATCH=300 ISTIRAHAT=2700 nohup ./run_patoshi.sh > patoshi.log 2>&1 &`
-
-**Menjalankan `patoshi_scan.py` langsung (cepat, tanpa istirahat)**
+**Running the CLI directly (fast, no rests)**
 
 ```bash
-python3 patoshi_scan.py                  # unduh + analisa blok 0–54316 (jeda 0,35 detik, ~1 jam)
-python3 patoshi_scan.py 0 5000           # unduh + analisa rentang tertentu
-python3 patoshi_scan.py unduh 0 5000     # hanya unduh
-python3 patoshi_scan.py analisa          # hanya analisa data yang sudah ada
-python3 patoshi_scan.py saldo 0 999      # cek saldo alamat Patoshi di blok 0–999
-python3 patoshi_scan.py plot             # buat plot_extranonce.png
-PATOSHI_JEDA=3 python3 patoshi_scan.py unduh 0 999
+python3 -m satoshi_tracker scan                  # download + analyze blocks 0–54316 (0.35 s delay, ~1 hour)
+python3 -m satoshi_tracker scan 0 5000           # a specific range
+python3 -m satoshi_tracker download 0 5000       # download only
+python3 -m satoshi_tracker analyze               # analyze existing data only
+python3 -m satoshi_tracker balance 0 999         # check balances of Patoshi addresses in blocks 0–999
+PATOSHI_DELAY=3 python3 -m satoshi_tracker download 0 999
 ```
 
-Kalau `unduh` dijalankan pada rentang sebagian, `analisa` juga hanya menganalisa rentang itu. Jalankan `python3 patoshi_scan.py analisa` (tanpa rentang) untuk menganalisa semua blok 0–54.316.
+If `download` runs on a partial range, `analyze` with that range only analyzes it. Run `python3 -m satoshi_tracker analyze` (no range) to analyze all blocks 0–54,316.
 
-### Fitur keamanan
+### Safety features
 
-- **Resume**: blok yang sudah ada di `blok_awal.csv` dilewati. Script aman dihentikan kapan saja.
-- **Lock**: `flock` pada `.run_patoshi.lock` mencegah dua `run_patoshi.sh` berjalan bersamaan.
-- **Retry**: setiap request dicoba sampai 6 kali dengan backoff 5, 10, 20, 40, 80, dan 160 detik. Kalau tetap gagal, `run_patoshi.sh` menunggu 30 menit lalu mencoba batch itu lagi.
-- **Beban rendah**: rata-rata sekitar 15–17 request per menit (jeda 3 detik plus istirahat antar batch), hanya baca data publik.
-- **Cache saldo**: alamat yang sudah dicek disimpan di `saldo_alamat.csv` dan tidak dicek ulang. Menjalankan `analisa` lagi tidak menghapus kolom saldo.
+- **Resume**: blocks already in `data/blocks.csv` are skipped. The script is safe to stop at any time.
+- **Lock**: `flock` on `.run_patoshi.lock` prevents two `run_patoshi.sh` runs at once.
+- **Retry**: each request is tried up to 6 times with backoff of 5, 10, 20, 40, 80 and 160 seconds. If it still fails, `run_patoshi.sh` waits 30 minutes and retries that batch.
+- **Low load**: on average about 15–17 requests per minute (3 s delay plus rests between batches), read-only public data.
+- **Balance cache**: checked addresses are stored in `data/balances.csv` and not checked again. Running `analyze` again does not remove the balance columns.
 
-### Format CSV
+### CSV format
 
-**`blok_awal.csv`** (dan 8 kolom pertama `alamat_patoshi.csv`):
+**`blocks.csv`** (and the first 8 columns of `patoshi_addresses.csv`):
 
-| Kolom | Isi |
+| Column | Content |
 |---|---|
-| `height` | Nomor blok |
-| `hash` | Hash blok |
-| `waktu_utc` | Timestamp blok (UTC) |
-| `nonce` | Nonce di header blok |
-| `nonce_lsb` | `nonce & 0xFF`, dasar filter Patoshi |
-| `extranonce` | ExtraNonce dari scriptSig coinbase |
-| `pubkey` | Public key penerima reward (P2PK) |
-| `alamat` | Alamat Bitcoin hasil konversi dari `pubkey` |
-| `keyakinan` | Hanya di `alamat_patoshi.csv`: `tinggi` / `sedang` / `rendah`, lihat "Filter ExtraNonce" |
+| `height` | Block number |
+| `hash` | Block hash |
+| `time_utc` | Block timestamp (UTC) |
+| `nonce` | Block header nonce |
+| `nonce_lsb` | `nonce & 0xFF`, the basis of the Patoshi filter |
+| `extranonce` | ExtraNonce from the coinbase scriptSig |
+| `pubkey` | Public key receiving the reward (P2PK) |
+| `address` | Bitcoin address derived from `pubkey` |
+| `confidence` | Only in `patoshi_addresses.csv`: `high` / `medium` / `low`, see "ExtraNonce filter" |
 
-**Kolom saldo** (ada di `saldo_alamat.csv` dan ditambahkan ke `alamat_patoshi.csv`; kosong kalau alamat belum dicek):
+**Balance columns** (in `balances.csv` and added to `patoshi_addresses.csv`; empty if the address has not been checked):
 
-| Kolom | Isi |
+| Column | Content |
 |---|---|
-| `coinbase_txid` | ID transaksi coinbase (reward) blok tersebut |
-| `reward_btc` | Nilai reward blok (biasanya 50 BTC) |
-| `reward_dipindah` | `tidak` = masih utuh; `ya` = sudah dibelanjakan; `genesis` = reward blok 0, yang secara protokol tidak bisa dibelanjakan |
-| `reward_dipindah_txid` | Transaksi yang membelanjakan reward (kalau `ya`) |
-| `saldo_p2pkh_btc` | Saldo kiriman lain ke alamat `1xxx` dari pubkey yang sama (umumnya donasi atau "tribute") |
-| `total_btc` | Isi wallet = reward (kalau belum dipindah) + `saldo_p2pkh_btc` |
-| `waktu_cek_utc` | Waktu saldo dicek; saldo bisa berubah setelahnya |
+| `coinbase_txid` | ID of the block's coinbase (reward) transaction |
+| `reward_btc` | Block reward value (usually 50 BTC) |
+| `reward_spent` | `no` = still untouched; `yes` = spent; `genesis` = the block 0 reward, which the protocol makes unspendable |
+| `reward_spent_txid` | Transaction that spent the reward (if `yes`) |
+| `p2pkh_balance_btc` | Balance of other payments to the `1xxx` address of the same pubkey (mostly donations or "tributes") |
+| `total_btc` | Wallet content = reward (if unspent) + `p2pkh_balance_btc` |
+| `checked_utc` | When the balance was checked; it can change afterwards |
 
-`blok_awal.csv` tidak selalu urut berdasarkan `height` (API mengembalikan blok dari yang terbaru ke yang lama di setiap request). `alamat_patoshi.csv` selalu urut naik.
+**`satoshi_wallets.csv`**: `address`, `balance_btc`, `reward_spent`, `status` (`checked` / `unchecked`), `height`, `block_time_utc`, `confidence`.
 
-### Verifikasi yang sudah dilakukan
+`blocks.csv` is not always sorted by `height` (the API returns blocks newest-first within each request). `patoshi_addresses.csv` is always sorted ascending.
 
-| Blok | Alamat hasil script | Keterangan |
+### Verification performed
+
+| Block | Address from the script | Note |
 |---|---|---|
-| 0 | `1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa` | Alamat genesis, cocok |
-| 9 | `12cbQLTFMXRnSzktFkuoG3eHoMeFtpTu3S` | Alamat Satoshi yang mengirim BTC ke Hal Finney, cocok |
-| 9 (saldo) | `reward_dipindah = ya`, tx `f4184fc5...` | Tx ke Hal Finney di blok 170, cocok |
-| 0 (saldo) | reward 50 + P2PKH 57,7 = 107,7 BTC | 50 BTC genesis ditandai `genesis` (tidak bisa dibelanjakan) |
+| 0 | `1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa` | Genesis address, matches |
+| 9 | `12cbQLTFMXRnSzktFkuoG3eHoMeFtpTu3S` | Satoshi's address that sent BTC to Hal Finney, matches |
+| 9 (balance) | `reward_spent = yes`, tx `f4184fc5...` | The Hal Finney tx in block 170, matches |
+| 0 (balance) | reward 50 + P2PKH 57.7 = 107.7 BTC | The 50 BTC genesis reward is flagged `genesis` (unspendable) |
 
-### Keterbatasan
+### Limitations
 
-- Filter hanya memakai **LSB nonce**. Penambang lain punya peluang sekitar 50/256 (sekitar 20%) untuk kebetulan masuk rentang yang sama, jadi hasilnya kemungkinan **lebih banyak** dari sekitar 22 ribu blok versi Lerner/Arkham. Untuk hasil lebih akurat, perlu ditambah analisis garis ExtraNonce (belum diimplementasikan).
-- Di blok di atas sekitar 30.000, blok Patoshi makin jarang dan garis ExtraNonce-nya putus-putus. Sebagian blok Patoshi asli di era ini masuk keyakinan `rendah`.
-- Parameter filter garis dipilih secara empiris. Hasilnya mendekati, tapi **tidak identik**, dengan daftar Lerner/Arkham.
-- `reward_btc` diambil dari output pertama coinbase. Blok awal hanya punya satu output, jadi ini sudah mencakup semua reward.
-- Ringkasan "Total isi wallet" hanya menjumlahkan alamat yang **sudah** dicek. Angka finalnya baru lengkap setelah tahap saldo selesai.
-- Atribusi ini berbasis **probabilitas statistik**, bukan bukti kepemilikan.
+- The nonce LSB filter alone lets other miners in with a probability of about 50/256 (about 20%), which is why the ExtraNonce line filter below is needed.
+- Above block ~30,000, Patoshi blocks become sparse and their ExtraNonce lines fragment. Some genuine Patoshi blocks from this era end up in the `low` class.
+- The line filter parameters were chosen empirically. The result is close to, but **not identical** with, the Lerner/Arkham list.
+- `reward_btc` is read from the first coinbase output. Early blocks have a single output, so this covers the full reward.
+- The attribution is **statistical**, not proof of ownership.
 
 ---
 
-## Filter ExtraNonce dan tingkat keyakinan
+## ExtraNonce filter and confidence levels
 
-Kalau ExtraNonce diplot terhadap height (`plot_extranonce.png`), blok Patoshi membentuk **garis-garis curam**: ExtraNonce naik cepat karena berasal dari satu mesin yang berjalan terus. Penambang lain membentuk **garis landai**. Sekitar 20% blok penambang lain kebetulan lolos filter LSB, dan titik-titik itu berada di garis landai.
+When ExtraNonce is plotted against height (`output/plot_extranonce.png`), Patoshi blocks form **steep lines**: ExtraNonce rises fast because it comes from one machine running continuously. Other miners form **shallow lines**. About 20% of other miners' blocks pass the LSB filter by chance, and those points sit on shallow lines.
 
-Cara kerja (`beri_keyakinan` di `patoshi_scan.py`), hanya pada blok yang lolos filter LSB:
+How it works (`classify` in `satoshi_tracker/domain/patoshi.py`), on blocks that pass the LSB filter only:
 
-1. **Jangkar**: titik yang punya tetangga sebelum *dan* sesudah (dalam 15 blok) yang segaris dan curam (kemiringan ≥ 3 ExtraNonce per blok, selisih ≤ 80, rasio kemiringan kedua sisi ≤ 2,5).
-2. **Tinggi**: dari jangkar, garis dikembangkan berulang kali sampai stabil. Titik masuk kalau berada di antara dua titik jangkar yang segaris (jendela 100 blok, kemiringan ≥ 2, selisih ≤ 600, rasio ≤ 3).
-3. **Sedang**: bukan tinggi, tapi punya minimal satu tetangga jangkar dengan kemiringan curam (jendela 60, selisih ≤ 300).
-4. **Rendah**: sisanya.
+1. **Anchors**: points with neighbours both before *and* after (within 15 blocks) that are collinear and steep (slope ≥ 3 ExtraNonce per block, step ≤ 80, slope ratio of both sides ≤ 2.5).
+2. **High**: starting from the anchors, lines are grown repeatedly until stable. A point joins when it lies between two collinear anchor points (window 100 blocks, slope ≥ 2, step ≤ 600, ratio ≤ 3).
+3. **Medium**: not high, but has at least one steep anchor neighbour (window 60, step ≤ 300).
+4. **Low**: everything else.
 
-**Hasil (blok 0–54.316)**
+**Results (blocks 0–54,316)**
 
-| | Alamat | Perkiraan false positive | Presisi | Perkiraan Patoshi asli |
+| | Addresses | Est. false positives | Precision | Est. true Patoshi |
 |---|---|---|---|---|
-| Lolos filter LSB | 28.746 | ~6.200 | ~78% | ~22.539 (statistik) |
-| Keyakinan **tinggi** | **19.815** | ~196 | **~99%** | ~19.619 |
-| Keyakinan **sedang** | 2.522 | ~525 | ~79% | ~1.997 |
-| **tinggi + sedang** | **22.337** | ~721 | ~97% | **~21.616** |
-| Keyakinan rendah | 6.409 | sebagian besar | | ~900 |
+| Passes LSB filter | 28,746 | ~6,200 | ~78% | ~22,539 (statistical) |
+| **High** confidence | **19,815** | ~196 | **~99%** | ~19,619 |
+| **Medium** confidence | 2,522 | ~525 | ~79% | ~1,997 |
+| **High + medium** | **22,337** | ~721 | ~97% | **~21,616** |
+| Low confidence | 6,409 | most | | ~900 |
 
-Sebagai pembanding, Arkham mencatat sekitar 21,9 ribu alamat dan Lerner sekitar 22 ribu blok (sekitar 1,1 juta BTC).
+For comparison, Arkham lists about 21.9 thousand addresses and Lerner about 22 thousand blocks (about 1.1 million BTC).
 
-**Cara mengukur false positive**: blok yang LSB nonce-nya di luar rentang Patoshi (206 dari 256 nilai) pasti bukan milik Satoshi. Filter garis yang sama dijalankan pada blok-blok itu. Persentase yang lolos dikalikan dengan perkiraan jumlah blok non-Patoshi yang kebetulan lolos filter LSB (`jumlah blok non-LSB × 50/206`).
+**How false positives are measured**: blocks whose nonce LSB lies outside the Patoshi range (206 of 256 values) are certainly not Satoshi's. The same line filter is run on those blocks. The share that passes is multiplied by the estimated number of non-Patoshi blocks that pass the LSB filter by chance (`non-LSB blocks × 50/206`).
 
 ---
 
-## Hasil akhir (snapshot saldo 3–7 Nov 2026)
+## Final results (balance snapshot 3–7 Nov 2026)
 
-| | Tinggi | Sedang | Tinggi + sedang |
+| | High | Medium | High + medium |
 |---|---|---|---|
-| Alamat | 19.815 | 2.522 | 22.337 |
-| Reward pernah dipindah | 207 (1,0%) | 460 (18,2%) | 667 (3,0%) |
-| Total saldo (BTC) | 980.409,27 | 103.170,80 | **1.083.580,07** |
+| Addresses | 19,815 | 2,522 | 22,337 |
+| Reward ever spent | 207 (1.0%) | 460 (18.2%) | 667 (3.0%) |
+| Total balance (BTC) | 980,409.27 | 103,170.80 | **1,083,580.07** |
 
-- **21.669 reward (97%) belum pernah dipindah.** Total sudah termasuk 77,58 BTC tribute P2PKH (sebagian besar di alamat genesis) dan reward genesis yang tidak bisa dibelanjakan.
-- Jumlah reward yang dipindah hampir sama dengan perkiraan false positive (207 vs ~196 di kelas tinggi, 460 vs ~525 di kelas sedang). Ini cocok dengan dugaan bahwa reward yang dipindah kebanyakan milik penambang lain yang lolos filter, sehingga menjadi validasi independen untuk filter ExtraNonce.
+- **21,669 rewards (97%) have never moved.** The total includes 77.58 BTC of P2PKH tributes (mostly on the genesis address) and the unspendable genesis reward.
+- The number of spent rewards is close to the estimated false positives (207 vs ~196 in the high class, 460 vs ~525 in the medium class). This fits the idea that spent rewards mostly belong to other miners who slipped through the filter, which makes it an independent validation of the ExtraNonce filter.
 
 ---
 
-## Visualisasi interaktif
+## Interactive visualizations
 
 ```bash
-python3 buat_bubble.py    # -> bubble_satoshi.html
-python3 buat_aliran.py    # -> aliran_dana.html (butuh waktu, satu request per tx/alamat baru)
+python3 -m satoshi_tracker bubble    # -> output/bubble_satoshi.html
+python3 -m satoshi_tracker flow      # -> output/fund_flow.html (slow: one request per new tx/address)
 ```
 
-**`buat_bubble.py`**: satu bubble per alamat tinggi+sedang. Sumbu x = waktu blok, sumbu y = ExtraNonce atau saldo (skala log), ukuran = saldo. Warna menunjukkan status reward (utuh / dipindah / genesis). Ada kotak pencarian alamat, dan klik bubble membuka alamatnya di mempool.space.
+**`bubble`**: one bubble per high + medium address. x axis = block time, y axis = ExtraNonce or balance (log scale), size = balance. Color shows the reward status (untouched / moved / genesis). Includes an address search box, and clicking a bubble opens the address on mempool.space.
 
-**`buat_aliran.py`**: menelusuri setiap reward Patoshi yang pernah dipindah (`reward_dipindah = ya` di `saldo_alamat.csv`), lalu mengikuti transaksinya sampai beberapa hop. Hasilnya graf node (vis-network):
-- node lingkaran = alamat (oranye = Patoshi, kuning = penerima terkenal seperti Hal Finney, biru = alamat lain); ukuran lingkaran = saldo saat ini
-- node belah ketupat = transaksi, berlabel tanggal (UTC); panel samping berisi daftar transaksi per tanggal
-- panah = BTC yang mengalir; oranye kalau keluar dari alamat Patoshi
+**`flow`**: traces every Patoshi reward that was ever moved (`reward_spent = yes` in `data/balances.csv`) and follows its transactions for a few hops. The result is a node graph (vis-network):
+- circle nodes = addresses (orange = Patoshi, yellow = known recipient such as Hal Finney, blue = other address); circle size = current balance
+- diamond nodes = transactions, labelled with their date (UTC); a side panel lists the transactions by date
+- arrows = BTC flowing; orange when leaving a Patoshi address
 
-| Variabel env | Default | Fungsi |
+| Env variable | Default | Purpose |
 |---|---|---|
-| `ALIRAN_HOP` | 2 | Kedalaman penelusuran |
-| `ALIRAN_MIN_BTC` | 1 | Output di bawah nilai ini tidak diikuti |
-| `ALIRAN_MAKS_TX` | 400 | Batas jumlah transaksi |
-| `ALIRAN_SALDO` | 1 | `0` = lewati cek saldo alamat (lebih cepat) |
+| `FLOW_HOP` | 2 | Trace depth |
+| `FLOW_MIN_BTC` | 1 | Outputs below this value are not followed |
+| `FLOW_MAX_TX` | 400 | Maximum number of transactions |
+| `FLOW_BALANCE` | 1 | `0` = skip the address balance check (faster) |
 
-Respons API disimpan di `aliran_cache.json`. Hapus file itu untuk mengambil saldo terbaru.
+API responses are cached in `output/flow_cache.json`. Delete that file to fetch fresh balances.
 
 ---
 
-## Dataset Kaggle
+## Kaggle dataset
 
 ```bash
-KAGGLE_USER=<username> python3 buat_kaggle.py
-kaggle datasets create -p kaggle_dataset                       # upload pertama
-kaggle datasets version -p kaggle_dataset -m "add balances"    # versi berikutnya
+KAGGLE_USER=<username> python3 -m satoshi_tracker kaggle --article ARTICLE.md
+kaggle datasets create -p output/kaggle_dataset                       # first upload
+kaggle datasets version -p output/kaggle_dataset -m "add balances"    # later versions
 ```
 
-`buat_kaggle.py` butuh `ARTICLE.md` di folder yang sama (artikel tidak disertakan di repo ini). Script ini mengubah CSV ke kolom bahasa Inggris, membuat gambar pipeline/histogram, dan menghitung `SHA256SUMS`. Kolom saldo di `patoshi_addresses.csv` disertakan otomatis setelah semua alamat tinggi+sedang selesai dicek.
+The `kaggle` command needs an article file (`--article`, default `ARTICLE.md` in the repository root) as the dataset description; the article is not included in this repository. The command renames columns for the dataset (`block_hash`, `timestamp_utc`, `coinbase_pubkey`, ...), draws the pipeline and histogram figures, and computes `SHA256SUMS`. Balance columns in `patoshi_addresses.csv` are included automatically once every high + medium address has been checked.
 
 ---
 
-## Referensi
+## References
 
-- Sergio Demian Lerner, *The Well Deserved Fortune of Satoshi Nakamoto* (2013) dan riset lanjutan "Patoshi pattern", di bitslog.com
-- API mempool.space: https://mempool.space/docs/api/rest
+- Sergio Demian Lerner, *The Well Deserved Fortune of Satoshi Nakamoto* (2013) and follow-up "Patoshi pattern" research, at bitslog.com
+- mempool.space API: https://mempool.space/docs/api/rest

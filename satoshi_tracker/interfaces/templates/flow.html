@@ -68,7 +68,7 @@ document.getElementById('foot').textContent =
   `Statistical attribution, not proof of ownership. Generated ${M.generated}.`;
 
 const COLOR = {patoshi: '#f7931a', label: '#ffd166', addr: '#4ea8de', tx: '#9aa5bd'};
-// lingkaran: luas sebanding saldo, minimal 6, maksimal 70
+// circle: area proportional to balance, min 6, max 70
 const bubble = n => n.btc === undefined ? 6 : Math.min(70, 6 + Math.sqrt(n.btc) * 3.2);
 const nodes = new vis.DataSet(D.nodes.map(n => ({
   id: n.id,

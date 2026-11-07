@@ -1,9 +1,12 @@
-# hanya kode, dokumentasi, dan data CSV
-*
-!.gitignore
-!README.md
-!*.py
-!run_patoshi.sh
-!aliran_template.html
-!*.csv
-buat_banner.py
+# generated files: figures, HTML, cache, logs, Kaggle package
+output/
+__pycache__/
+*.pyc
+.run_patoshi.lock
+
+# local article material (not part of this repository)
+ARTICLE.md
+*.png
+make_banner.py
+ecdsa_fail/
+*.log
