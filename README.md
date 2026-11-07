@@ -14,7 +14,7 @@ All data comes from the **public [mempool.space](https://mempool.space) API**. N
 ## Architecture (Domain-Driven Design)
 
 ```
-Finding-Satoshi-Wallet/
+finding-satoshi-address/
 ├── satoshi_tracker/                 Python package (standard library only; matplotlib for figures)
 │   ├── domain/                      pure business rules, no I/O
 │   │   ├── bitcoin.py               amounts, Base58Check / P2PKH address derivation, coinbase ExtraNonce parsing
@@ -195,7 +195,7 @@ balances.csv (cache, appended) ──► merged into patoshi_addresses.csv
 **Recommended: run each stage slowly in the background**
 
 ```bash
-cd Finding-Satoshi-Wallet
+cd finding-satoshi-address
 mkdir -p output
 
 # 1. Download blocks + analyze the pattern (about 1 day)
