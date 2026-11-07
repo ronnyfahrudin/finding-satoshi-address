@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Bubble plot interaktif semua alamat Patoshi (keyakinan tinggi+sedang) -> bubble_satoshi.html
+
+Sumbu x = waktu blok, sumbu y = ExtraNonce (garis Patoshi), ukuran bubble = saldo BTC,
+warna = status reward (utuh / sudah dipindah / genesis / belum dicek).
+Hover menampilkan alamat dan saldo; klik membuka alamat di mempool.space.
+
+Pemakaian:  python3 buat_bubble.py   (jalankan ulang setelah saldo bertambah)
+"""
+import csv
+import json
+import os
+
+import patoshi_scan as ps
+
+DIR = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.join(DIR, "bubble_satoshi.html")
+
+HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Satoshi Patoshi Bubbles</title>
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+<style>
+  :root { --bg:#0b0f19; --panel:#131a2a; --ink:#e8ecf4; --quiet:#8f9bb3; --accent:#f7931a; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:20px 16px 8px; max-width:1400px; margin:auto; }
+  h1 { margin:0 0 4px; font-size:22px; }
+  h1 span { color:var(--accent); }
+  .sub { color:var(--quiet); margin:0; }
+  .stats { display:flex; flex-wrap:wrap; gap:10px; margin:14px 0 6px; }
+  .stat { background:var(--panel); border-radius:10px; padding:10px 14px; min-width:150px; }
+  .stat b { display:block; font-size:20px; color:var(--accent); }
+  .stat small { color:var(--quiet); }
+  .controls { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:8px 0; }
+  select, input { background:var(--panel); color:var(--ink); border:1px solid #2a3550; border-radius:8px; padding:7px 10px; font:inherit; }
+  input { min-width:280px; flex:1; max-width:460px; }
+  #msg { color:var(--quiet); }
+  #plot { width:100%; max-width:1400px; height:72vh; min-height:420px; margin:auto; }
+  footer { color:var(--quiet); font-size:12px; padding:8px 16px 24px; max-width:1400px; margin:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>Patoshi</span> addresses: every early block attributed to Satoshi</h1>
+  <p class="sub">Each bubble is one block reward. Bubble size = current balance. Hover for details; click to open the address on mempool.space.</p>
+  <div class="stats" id="stats"></div>
+  <div class="controls">
+    <label>Y axis <select id="yaxis">
+      <option value="extranonce">ExtraNonce (Patoshi lines)</option>
+      <option value="btc">Balance (BTC)</option>
+    </select></label>
+    <input id="search" placeholder="Find an address (paste 1A1zP1eP5...)" autocomplete="off">
+    <span id="msg"></span>
+  </div>
+</header>
+<div id="plot"></div>
+<footer>Data: Bitcoin blocks 0&ndash;54,316 via mempool.space; Patoshi attribution by nonce LSB + ExtraNonce line tracking (high + medium confidence).
+Statistical attribution, not proof of ownership. Generated __GENERATED__.</footer>
+<script>
+const D = __DATA__;
+const GROUPS = [
+  {key:'unchecked', name:'Not checked yet', color:'#4a5878'},
+  {key:'unspent', name:'Reward untouched', color:'#f7931a'},
+  {key:'spent', name:'Reward moved', color:'#ff4d6d'},
+  {key:'genesis', name:'Genesis (unspendable)', color:'#ffd166'},
+];
+const fmt = (v, d=2) => v.toLocaleString('en-US', {minimumFractionDigits:d, maximumFractionDigits:d});
+
+function stats() {
+  const chk = D.filter(r => r.s !== 'unchecked');
+  const total = chk.reduce((a, r) => a + r.btc, 0);
+  const moved = chk.filter(r => r.s === 'spent').length;
+  const cards = [
+    [D.length.toLocaleString('en-US'), 'addresses (high + medium)'],
+    [`${chk.length.toLocaleString('en-US')} (${(100 * chk.length / D.length).toFixed(1)}%)`, 'balances checked'],
+    [fmt(total, 0) + ' BTC', 'held by checked addresses'],
+    [moved.toLocaleString('en-US'), 'rewards ever moved'],
+  ];
+  document.getElementById('stats').innerHTML = cards.map(c => `<div class="stat"><b>${c[0]}</b><small>${c[1]}</small></div>`).join('');
+}
+
+function traces(y) {
+  return GROUPS.map(g => {
+    const rs = D.filter(r => r.s === g.key);
+    return {
+      type: 'scattergl', mode: 'markers', name: `${g.name} (${rs.length.toLocaleString('en-US')})`,
+      x: rs.map(r => r.t), y: rs.map(r => y === 'btc' ? Math.max(r.btc, 0.001) : r.en),
+      customdata: rs.map(r => [r.a, r.h, r.btc, r.c, r.s]),
+      marker: {
+        color: g.color, opacity: g.key === 'unchecked' ? 0.35 : 0.85,
+        symbol: g.key === 'spent' ? 'x' : g.key === 'genesis' ? 'star' : 'circle',
+        size: rs.map(r => r.s === 'unchecked' ? 3 : r.s === 'spent' ? 11 : Math.max(3, Math.sqrt(r.btc) * 1.1)),
+        line: {width: 0},
+      },
+      hovertemplate: '<b>%{customdata[0]}</b><br>block %{customdata[1]} · %{x|%Y-%m-%d}<br>' +
+        (g.key === 'unchecked' ? 'balance not checked yet' : 'balance %{customdata[2]:,.8f} BTC') +
+        '<br>confidence %{customdata[3]}<extra>' + g.name + '</extra>',
+    };
+  });
+}
+
+function layout(y) {
+  return {
+    paper_bgcolor: '#0b0f19', plot_bgcolor: '#0b0f19', font: {color: '#e8ecf4'},
+    margin: {l: 64, r: 16, t: 16, b: 48},
+    xaxis: {title: 'block time', gridcolor: '#1c2438'},
+    yaxis: y === 'btc'
+      ? {title: 'balance (BTC, log scale)', type: 'log', gridcolor: '#1c2438'}
+      : {title: 'ExtraNonce', gridcolor: '#1c2438', range: [0, 7000]},
+    legend: {orientation: 'h', y: 1.06},
+    hoverlabel: {bgcolor: '#131a2a', font: {family: 'monospace'}},
+    shapes: [],
+  };
+}
+
+const el = document.getElementById('plot');
+function draw() {
+  const y = document.getElementById('yaxis').value;
+  Plotly.react(el, traces(y), layout(y), {responsive: true, displaylogo: false});
+}
+stats();
+draw();
+document.getElementById('yaxis').addEventListener('change', () => { draw(); find(); });
+el.on('plotly_click', ev => {
+  const p = ev.points && ev.points[0];
+  if (p) window.open('https://mempool.space/address/' + p.customdata[0], '_blank', 'noopener');
+});
+
+function find() {
+  const q = document.getElementById('search').value.trim();
+  const msg = document.getElementById('msg');
+  const lay = layout(document.getElementById('yaxis').value);
+  if (!q) { msg.textContent = ''; Plotly.relayout(el, {shapes: [], annotations: []}); return; }
+  const r = D.find(d => d.a === q);
+  if (!r) { msg.textContent = 'not in the Patoshi list'; Plotly.relayout(el, {shapes: [], annotations: []}); return; }
+  const yv = lay.yaxis.type === 'log' ? Math.max(r.btc, 0.001) : r.en;
+  msg.textContent = `block ${r.h} · ${r.s === 'unchecked' ? 'not checked yet' : fmt(r.btc, 8) + ' BTC'}`;
+  Plotly.relayout(el, {
+    shapes: [{type: 'line', x0: r.t, x1: r.t, yref: 'paper', y0: 0, y1: 1, line: {color: '#ffffff', width: 1, dash: 'dot'}}],
+    annotations: [{x: r.t, y: lay.yaxis.type === 'log' ? Math.log10(yv) : yv, text: r.a.slice(0, 10) + '…', showarrow: true,
+                   arrowcolor: '#fff', font: {color: '#fff'}, bgcolor: '#131a2a'}],
+  });
+}
+document.getElementById('search').addEventListener('input', find);
+</script>
+</body>
+</html>
+"""
+
+
+def main():
+    with open(ps.PATOSHI_CSV) as f:
+        pat = [r for r in csv.DictReader(f) if r["keyakinan"] in ("tinggi", "sedang")]
+    saldo = ps.baca_saldo()
+    status = {"tidak": "unspent", "ya": "spent", "genesis": "genesis"}
+    data = []
+    for r in pat:
+        s = saldo.get(int(r["height"]))
+        data.append({
+            "a": r["alamat"],
+            "h": int(r["height"]),
+            "t": r["waktu_utc"].replace(" ", "T"),
+            "en": int(r["extranonce"] or 0),
+            "c": "high" if r["keyakinan"] == "tinggi" else "medium",
+            "s": status.get(s["reward_dipindah"], "unchecked") if s else "unchecked",
+            "btc": round(float(s["total_btc"]), 8) if s else 0,
+        })
+    from datetime import datetime, timezone
+    html = (HTML.replace("__DATA__", json.dumps(data, separators=(",", ":")))
+                .replace("__GENERATED__", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")))
+    with open(OUT, "w") as f:
+        f.write(html)
+    dicek = sum(d["s"] != "unchecked" for d in data)
+    print(f"Alamat     : {len(data):,} (saldo dicek {dicek:,})")
+    print(f"Ukuran file: {os.path.getsize(OUT) / 1e6:.2f} MB")
+    print(f"Tersimpan  : {OUT}")
+
+
+if __name__ == "__main__":
+    main()

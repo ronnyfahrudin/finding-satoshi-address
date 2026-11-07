@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Satoshi Coin Flows</title>
+<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+<style>
+  :root { --bg:#0b0f19; --panel:#131a2a; --ink:#e8ecf4; --quiet:#8f9bb3; --accent:#f7931a; --blue:#4ea8de; }
+  * { box-sizing:border-box; }
+  html, body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; display:flex; flex-direction:column; }
+  header { padding:16px 16px 6px; }
+  h1 { margin:0 0 4px; font-size:21px; }
+  h1 span { color:var(--accent); }
+  .sub { color:var(--quiet); margin:0; }
+  .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:10px 0 4px; }
+  .stat { background:var(--panel); border-radius:10px; padding:8px 12px; }
+  .stat b { color:var(--accent); font-size:17px; margin-right:4px; }
+  .legend { display:flex; flex-wrap:wrap; gap:14px; color:var(--quiet); font-size:13px; }
+  .dot { display:inline-block; width:11px; height:11px; border-radius:50%; margin-right:5px; vertical-align:-1px; }
+  .dia { display:inline-block; width:10px; height:10px; transform:rotate(45deg); margin-right:6px; background:#9aa5bd; }
+  main { flex:1; display:flex; min-height:0; }
+  #net { flex:1; min-height:420px; }
+  aside { width:320px; background:var(--panel); padding:14px; overflow:auto; border-left:1px solid #1f2940; }
+  aside h2 { font-size:15px; margin:0 0 8px; }
+  aside code { word-break:break-all; color:var(--accent); }
+  aside a { color:var(--blue); }
+  aside table { width:100%; border-collapse:collapse; font-size:12.5px; margin-top:8px; }
+  aside td { padding:3px 0; border-bottom:1px solid #1f2940; vertical-align:top; }
+  aside td:last-child { text-align:right; white-space:nowrap; }
+  .hint { color:var(--quiet); }
+  footer { color:var(--quiet); font-size:12px; padding:6px 16px 12px; }
+  @media (max-width: 760px) { main { flex-direction:column; } aside { width:auto; border-left:0; border-top:1px solid #1f2940; } #net { min-height:60vh; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Where Satoshi's <span>mined coins</span> went</h1>
+  <p class="sub">Every Patoshi block reward that was ever spent, followed through the transactions that moved it. Arrow thickness = BTC moved; orange arrows carry coins out of Satoshi's addresses.</p>
+  <div class="bar" id="stats"></div>
+  <div class="legend">
+    <span><i class="dot" style="background:#f7931a"></i>Patoshi (mined by Satoshi)</span>
+    <span><i class="dot" style="background:#ffd166"></i>Known recipient</span>
+    <span><i class="dot" style="background:#4ea8de"></i>Other address</span>
+    <span><i class="dia"></i>Transaction (labelled with its date, UTC)</span>
+    <span>Circle size = current balance</span>
+  </div>
+</header>
+<main>
+  <div id="net"></div>
+  <aside id="info"></aside>
+</main>
+<footer id="foot"></footer>
+<script>
+const D = __DATA__;
+const M = D.meta;
+const fmt = v => v.toLocaleString('en-US', {maximumFractionDigits: 8});
+const moved = D.edges.filter(e => D.nodes.find(n => n.id === e.from && n.kind === 'patoshi')).reduce((a, e) => a + e.btc, 0);
+document.getElementById('stats').innerHTML = [
+  [M.spent_rewards, 'spent rewards found'],
+  [M.checked.toLocaleString('en-US'), 'addresses checked so far'],
+  [D.nodes.filter(n => n.kind === 'tx').length, 'transactions traced'],
+  [fmt(Math.round(moved)), 'BTC left Patoshi addresses'],
+].map(s => `<span class="stat"><b>${s[0]}</b>${s[1]}</span>`).join('');
+document.getElementById('foot').textContent =
+  `Traced ${M.hop} hop(s); outputs under ${M.min_btc} BTC are not followed further. Data: mempool.space. ` +
+  `Statistical attribution, not proof of ownership. Generated ${M.generated}.`;
+
+const COLOR = {patoshi: '#f7931a', label: '#ffd166', addr: '#4ea8de', tx: '#9aa5bd'};
+// lingkaran: luas sebanding saldo, minimal 6, maksimal 70
+const bubble = n => n.btc === undefined ? 6 : Math.min(70, 6 + Math.sqrt(n.btc) * 3.2);
+const nodes = new vis.DataSet(D.nodes.map(n => ({
+  id: n.id,
+  label: n.kind === 'tx' ? n.time : n.label,
+  title: n.kind === 'tx' ? `${n.label}\n${n.time}` : `${n.id}\nbalance: ${n.btc === undefined ? 'unknown' : fmt(n.btc) + ' BTC'}`,
+  shape: n.kind === 'tx' ? 'diamond' : 'dot',
+  size: n.kind === 'tx' ? 7 : bubble(n),
+  color: {background: COLOR[n.kind], border: COLOR[n.kind], highlight: {background: '#ffffff', border: COLOR[n.kind]}},
+  font: n.kind === 'tx'
+    ? {color: '#c9d1e3', size: 22, strokeWidth: 4, strokeColor: '#0b0f19', vadjust: -4}
+    : {color: '#e8ecf4', size: n.kind === 'addr' ? 10 : 13, strokeWidth: 3, strokeColor: '#0b0f19'},
+})));
+const byKind = Object.fromEntries(D.nodes.map(n => [n.id, n.kind]));
+const edges = new vis.DataSet(D.edges.map((e, i) => ({
+  id: i, from: e.from, to: e.to, arrows: {to: {enabled: true, scaleFactor: 0.5}},
+  width: Math.min(10, 0.6 + Math.sqrt(e.btc) * 0.9),
+  title: `${fmt(e.btc)} BTC`,
+  color: {color: (byKind[e.from] === 'patoshi') ? '#f7931acc' : '#5b6b8a88', highlight: '#ffffff'},
+  smooth: {type: 'continuous'},
+})));
+const net = new vis.Network(document.getElementById('net'), {nodes, edges}, {
+  physics: {solver: 'forceAtlas2Based', forceAtlas2Based: {gravitationalConstant: -40, springLength: 70}, stabilization: {iterations: 300}},
+  layout: {improvedLayout: false},
+  interaction: {hover: true, tooltipDelay: 120},
+});
+
+const byId = Object.fromEntries(D.nodes.map(n => [n.id, n]));
+const name = id => { const n = byId[id]; return n.kind === 'tx' ? `${n.time} · tx ${n.txid.slice(0, 8)}…` : (n.kind === 'addr' ? id.slice(0, 14) + '…' : n.label); };
+function timeline() {
+  const txs = D.nodes.filter(n => n.kind === 'tx').sort((a, b) => (a.height || 0) - (b.height || 0));
+  const out = n => D.edges.filter(e => e.to === n.id && byKind[e.from] === 'patoshi').reduce((a, e) => a + e.btc, 0);
+  document.getElementById('info').innerHTML =
+    `<h2>Transactions by date</h2><p class="hint">Click a row to jump to it in the graph, or click any node for details.</p>` +
+    `<table><tr><td class="hint">date (UTC) · block</td><td class="hint">from Patoshi</td></tr>` +
+    txs.map(n => `<tr class="row" data-id="${n.id}" style="cursor:pointer"><td>${n.time} · ${n.height}<br><span class="hint">hop ${n.hop} · ${n.txid.slice(0, 12)}…</span></td>` +
+                 `<td>${out(n) ? fmt(out(n)) + ' BTC' : '–'}</td></tr>`).join('') + `</table>`;
+  document.querySelectorAll('.row').forEach(r => r.addEventListener('click', () => {
+    net.selectNodes([r.dataset.id]);
+    net.focus(r.dataset.id, {scale: 1.4, animation: true});
+    net.emit('click', {nodes: [r.dataset.id]});
+  }));
+}
+timeline();
+
+net.on('click', p => {
+  if (!p.nodes.length) { timeline(); return; }
+  const n = byId[p.nodes[0]];
+  const ins = D.edges.filter(e => e.to === n.id), outs = D.edges.filter(e => e.from === n.id);
+  const rows = (list, key) => list.map(e => `<tr><td>${name(e[key])}</td><td>${fmt(e.btc)} BTC</td></tr>`).join('');
+  const link = n.kind === 'tx' ? `https://mempool.space/tx/${n.txid}` : `https://mempool.space/address/${n.id}`;
+  document.getElementById('info').innerHTML =
+    `<h2>${n.kind === 'tx' ? 'Transaction' : n.kind === 'patoshi' ? 'Patoshi address · ' + n.label : n.kind === 'label' ? n.label : 'Address'}</h2>` +
+    `<code>${n.kind === 'tx' ? n.txid : n.id}</code>` +
+    (n.kind !== 'tx' ? `<p>Current balance: <b>${n.btc === undefined ? 'unknown' : fmt(n.btc) + ' BTC'}</b></p>` : '') +
+    (n.kind === 'tx' ? `<p>Block ${n.height} · ${n.time} · hop ${n.hop}</p>` : '') +
+    `<p><a href="${link}" target="_blank" rel="noopener">Open on mempool.space ↗</a> · <a href="#" id="back">all dates</a></p>` +
+    (ins.length ? `<b>In</b><table>${rows(ins, 'from')}</table>` : '') +
+    (outs.length ? `<p></p><b>Out</b><table>${rows(outs, 'to')}</table>` : '');
+  document.getElementById('back').addEventListener('click', ev => { ev.preventDefault(); timeline(); });
+});
+net.on('doubleClick', p => {
+  if (!p.nodes.length) return;
+  const n = byId[p.nodes[0]];
+  window.open(n.kind === 'tx' ? `https://mempool.space/tx/${n.txid}` : `https://mempool.space/address/${n.id}`, '_blank', 'noopener');
+});
+</script>
+</body>
+</html>

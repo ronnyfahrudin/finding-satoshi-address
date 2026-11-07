@@ -1,0 +1,9 @@
+# hanya kode, dokumentasi, dan data CSV
+*
+!.gitignore
+!README.md
+!*.py
+!run_patoshi.sh
+!aliran_template.html
+!*.csv
+buat_banner.py
